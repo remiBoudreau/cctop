@@ -679,10 +679,10 @@ def run_tui(
     class CctopApp(App):
         CSS = """
         Screen { layout: vertical; }
-        #system { height: 3; padding: 0 1; }
-        #accounts { height: auto; max-height: 50%; padding: 0 1; }
-        #panel { height: 1fr; padding: 0 1; }
-        #panel.hidden { display: none; }
+        #system   { height: 5; padding: 1 2; }
+        #accounts { height: auto; max-height: 50%; padding: 1 2; }
+        #panel    { height: 1fr; padding: 1 2; }
+        #panel.hidden    { display: none; }
         #accounts.fullheight { height: 1fr; max-height: 100%; }
         """
         ansi_color = True
@@ -786,20 +786,41 @@ def run_tui(
             new_map = active_engagements_by_profile()
             if new_map == self.engagement_map:
                 return False
+            was_empty = not self.engagement_map
             self.engagement_map = new_map
             # Rebuild virtual rows and clamp selection
             self._virtual_rows = build_account_rows(
                 self.accounts, self.engagement_map, self.sort_mode
             )
             if self._virtual_rows:
-                self.selected_row = max(0, min(self.selected_row, len(self._virtual_rows) - 1))
+                # On first population, seek to the first row that actually
+                # has an engagement so the panel shows useful content.
+                if was_empty and self.panel_enabled:
+                    for i, (_, eng, _, _) in enumerate(self._virtual_rows):
+                        if eng:
+                            self.selected_row = i
+                            break
+                    else:
+                        self.selected_row = 0
+                else:
+                    self.selected_row = max(0, min(self.selected_row, len(self._virtual_rows) - 1))
             else:
                 self.selected_row = -1
             return True
 
         def _sync_panel_engagement(self) -> None:
-            """Inform the panel which engagement is currently selected."""
-            if not self.show_panel or not self._virtual_rows or self.selected_row < 0:
+            """Inform the panel which engagement is currently selected.
+
+            Runs independently of panel visibility — we still update the
+            panel's engagement state so that when the panel becomes
+            visible (resize, F3 toggle, or first layout) it already has
+            data to render. Early-exiting on !show_panel caused an
+            'on-load shows no engagement' bug because self.size.height
+            is 0 before the first layout pass.
+            """
+            if not self.panel_enabled:
+                return
+            if not self._virtual_rows or self.selected_row < 0:
                 self.panel.on_engagement_change(None, None)
                 return
             _, eng, _, _ = self._virtual_rows[self.selected_row]
