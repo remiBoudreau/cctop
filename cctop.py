@@ -63,12 +63,12 @@ DEFAULT_INTERVAL_BLUR = 300
 # Default 2 Hz (every 500 ms). Override with --system-hz.
 DEFAULT_SYSTEM_HZ = 2
 
-# Minimum terminal height (rows) to show the bottom panel. Below this,
-# hide the panel and give all vertical space to the accounts pane.
-# System bar (3) + accounts header (1) + ~8 accounts + footer (1) needs
-# ~13 rows just for the top half. Require at least 12 more rows for
-# a useful panel view.
+# Minimum terminal dimensions to show rich UI features.
+# Below PANEL_MIN_HEIGHT rows: hide bottom panel (too short to be useful).
+# Below PANEL_MIN_WIDTH cols: hide bottom panel AND the Engagement
+# column (accounts table needs ~80 chars for readable bars alone).
 DEFAULT_PANEL_MIN_HEIGHT = 25
+DEFAULT_PANEL_MIN_WIDTH = 100
 
 IN_USE_WINDOW_SEC = 120
 HTTP_TIMEOUT = 10.0
@@ -275,10 +275,24 @@ async def poll_account(client: httpx.AsyncClient, account: AccountState) -> None
 
 
 async def poll_all(accounts: list[AccountState]) -> None:
-    """Poll all accounts that aren't in cooldown, in parallel.
-    Accounts in cooldown keep their existing state — no wipe, no retry."""
+    """Poll accounts SEQUENTIALLY with a small delay between each.
+
+    Anthropic's /api/oauth/usage endpoint rate-limits per-IP. Firing
+    all N accounts via asyncio.gather in parallel produced burst 429s
+    that applied to every account, even though each account was under
+    its own per-account limit. Serializing with a ~1s gap between
+    requests keeps us under Anthropic's burst threshold without
+    meaningfully slowing the UI (N accounts = ~N seconds total, and
+    accounts already in cooldown short-circuit instantly).
+    """
     async with httpx.AsyncClient() as client:
-        await asyncio.gather(*(poll_account(client, a) for a in accounts))
+        for i, account in enumerate(accounts):
+            if i > 0:
+                # 1s gap between polls keeps us under Anthropic's burst
+                # rate limit. Skipped if account is in cooldown (fast path).
+                if account.cooldown_remaining <= 0:
+                    await asyncio.sleep(1.0)
+            await poll_account(client, account)
 
 
 # ─── rendering helpers ─────────────────────────────────────────────────────────
@@ -469,6 +483,7 @@ def render_accounts(
     term_width: int,
     engagement_map: dict[str, list[str]] | None = None,
     selected_row: int = -1,
+    show_engagement_column: bool = True,
 ) -> Text:
     now = datetime.now(timezone.utc)
 
@@ -481,10 +496,11 @@ def render_accounts(
     def key_7d(a: AccountState) -> float:
         return pct(a.snapshot.seven_day) if a.snapshot else -1.0
 
-    # Build the flat row list and compute group membership so the render
-    # loop can decide where to place bars within each group (row-shift
-    # behavior when the cursor is inside a multi-engagement group).
-    rows = build_account_rows(accounts, engagement_map or {}, sort_mode)
+    # Build the flat row list. If the engagement column is hidden
+    # (narrow terminal), collapse each account to a single row so
+    # multi-instance accounts don't produce blank rows without context.
+    eng_for_layout: dict[str, list[str]] = (engagement_map or {}) if show_engagement_column else {}
+    rows = build_account_rows(accounts, eng_for_layout, sort_mode)
     if not rows:
         return Text("(no accounts)\n", style="dim")
 
@@ -492,19 +508,23 @@ def render_accounts(
     name_w = max(name_w, 8)
 
     # Engagement column: fit the longest active engagement name + padding,
-    # clamped to a sensible range so short names don't waste space and
-    # long names don't push the bars too narrow.
-    max_eng_len = max(
-        (len(e) for engs in (engagement_map or {}).values() for e in engs),
-        default=0,
-    )
-    ENG_W = max(12, min(24, max_eng_len + 2))
+    # clamped to a sensible range. Set to 0 when hidden.
+    if show_engagement_column:
+        max_eng_len = max(
+            (len(e) for engs in (engagement_map or {}).values() for e in engs),
+            default=0,
+        )
+        ENG_W = max(12, min(24, max_eng_len + 2))
+        eng_section_width = ENG_W + 1  # leading space before engagement
+    else:
+        ENG_W = 0
+        eng_section_width = 0
     RESET_W = 8  # reset/error column width
 
     # Bar width: divide remaining space between the two bars, but cap so
     # very wide terminals don't produce 100+-char bars that look stretched.
     MAX_BW = 40
-    fixed = name_w + 30 + ENG_W + 1
+    fixed = name_w + 30 + eng_section_width
     avail = term_width - fixed - 1
     bw = max(5, min(MAX_BW, avail // 2))
     # Extra unused width (when terminal is wider than our max layout) goes
@@ -519,8 +539,9 @@ def render_accounts(
         f" # {'Account':<{name_w}}  "
         f"{'5-hour':<{bw + 2}} {'reset':>{RESET_W}}"
         f"  {'7-day':<{bw + 2}} {'reset':>{RESET_W}}"
-        f" {'Engagement':<{ENG_W}}"
     )
+    if show_engagement_column:
+        header_text += f" {'Engagement':<{ENG_W}}"
     pad_count = max(0, term_width - len(header_text))
     out.append(header_text + (" " * pad_count), style=HEADER_STYLE)
     out.append("\n")
@@ -587,22 +608,23 @@ def render_accounts(
             blank_w = name_w + 2 + (bw + 2) + 1 + RESET_W + 2 + (bw + 2) + 1 + RESET_W
             out.append(" " * blank_w)
 
-        # Engagement column (always per row). Selected cell = green text
-        # + trailing ◀ marker. Background stays the terminal default.
-        eng_text = eng if eng else "—"
-        eng_display = (eng_text[: ENG_W - 1] + "…") if len(eng_text) > ENG_W else eng_text
-        if is_selected:
-            eng_style = "bold green"
-        elif eng:
-            eng_style = "white"
-        else:
-            eng_style = "bright_black"
-        out.append(" ")
-        out.append(f"{eng_display:<{ENG_W}}", style=eng_style)
-        if is_selected:
-            out.append(" ◀", style="bold green")
-        else:
-            out.append("  ")
+        # Engagement column (if visible). Selected cell = green text
+        # + trailing ◀ marker. Background stays terminal default.
+        if show_engagement_column:
+            eng_text = eng if eng else "—"
+            eng_display = (eng_text[: ENG_W - 1] + "…") if len(eng_text) > ENG_W else eng_text
+            if is_selected:
+                eng_style = "bold green"
+            elif eng:
+                eng_style = "white"
+            else:
+                eng_style = "bright_black"
+            out.append(" ")
+            out.append(f"{eng_display:<{ENG_W}}", style=eng_style)
+            if is_selected:
+                out.append(" ◀", style="bold green")
+            else:
+                out.append("  ")
         if trailing_pad > 0:
             out.append(" " * trailing_pad)
         out.append("\n")
@@ -720,7 +742,15 @@ def run_tui(
             if self._panel_override is not None:
                 return self._panel_override
             h = self.size.height or 30
-            return h >= DEFAULT_PANEL_MIN_HEIGHT
+            w = self.size.width or 120
+            return h >= DEFAULT_PANEL_MIN_HEIGHT and w >= DEFAULT_PANEL_MIN_WIDTH
+
+        @property
+        def show_engagement_column(self) -> bool:
+            """Whether the accounts table includes the Engagement column.
+            Dropped on narrow terminals where it steals too much bar space."""
+            w = self.size.width or 120
+            return w >= DEFAULT_PANEL_MIN_WIDTH
 
         def compose(self) -> ComposeResult:
             yield Static(id="system")
@@ -864,6 +894,7 @@ def run_tui(
                     render_accounts(
                         self.accounts, self.warn, self.crit, self.sort_mode,
                         usable, self.engagement_map, self.selected_row,
+                        show_engagement_column=self.show_engagement_column,
                     )
                 )
                 self.sub_title = f"{len(self.accounts)} accounts · panel={self.panel.name}"

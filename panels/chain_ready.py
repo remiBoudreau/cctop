@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 from rich.console import Group
+from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.text import Text
 
@@ -31,28 +32,19 @@ _META_ORDER = [
     "RQG Passed",
 ]
 
-# Section headers we render, in display order. First two are the new
-# canonical spec (Summary / The Attack). The rest are legacy names from
-# older findings.md files — shown as fallback if the canonical sections
-# are missing. Everything not in this set is discarded.
-_SECTION_ORDER = [
-    "Summary",
-    "The Attack",
-    "What Was Found",
-    "Validation",
-    "Chain Notes",
-    "Impact",
-]
-_SECTION_SET = set(_SECTION_ORDER)
-
 
 @dataclass
 class Finding:
-    """One CHAIN-READY finding extracted from findings.md."""
+    """One CHAIN-READY finding extracted from findings.md.
+
+    Captures the full body of the finding verbatim (including any
+    ### sub-sections, code blocks, prose) so the panel can render
+    whatever the author wrote regardless of template.
+    """
 
     title: str
     metadata: dict[str, str] = field(default_factory=dict)
-    sections: dict[str, str] = field(default_factory=dict)
+    body: str = ""
 
 
 def _cvss_color(score: str) -> str:
@@ -134,37 +126,37 @@ def _parse_findings(findings_md: Path) -> List[Finding]:
             continue
 
         finding = Finding(title=_parse_title(header))
-        current_section: str | None = None
-        section_lines: list[str] = []
-
-        def flush():
-            nonlocal section_lines
-            if current_section and current_section in _SECTION_SET:
-                finding.sections[current_section] = "\n".join(section_lines).strip()
-            section_lines = []
-
+        # Two phases:
+        # 1. Metadata phase: consume '**Key:** value' lines at the top.
+        #    Ends when we hit any non-metadata line (blank, section
+        #    header, prose, code block, etc.).
+        # 2. Body phase: everything from there to end-of-block goes
+        #    verbatim into finding.body. No section filtering.
+        in_metadata = True
+        body_lines: list[str] = []
         for raw in lines[1:]:
             line = raw.rstrip()
             if line.startswith("## "):
                 break
-            # Section header
-            m = re.match(r"^###\s+(.+?)\s*$", line)
-            if m:
-                flush()
-                current_section = m.group(1).strip()
-                continue
-            # Metadata line: **Key:** value (only at top of finding, before sections)
-            m = re.match(r"^\*\*([^*]+):\*\*\s*(.*)$", line)
-            if m and current_section is None:
-                key = m.group(1).strip()
-                val = m.group(2).strip()
-                if key in _META_ORDER:
-                    finding.metadata[key] = val
-                continue
-            # Regular content line for the current section
-            if current_section and current_section in _SECTION_SET:
-                section_lines.append(line)
-        flush()
+            if in_metadata:
+                m = re.match(r"^\*\*([^*]+):\*\*\s*(.*)$", line)
+                if m and m.group(1).strip() in _META_ORDER:
+                    finding.metadata[m.group(1).strip()] = m.group(2).strip()
+                    continue
+                # Blank lines during the metadata phase are just
+                # visual separators — skip them without ending the phase.
+                if not line.strip():
+                    continue
+                # Non-blank, non-**known-key:** content ends metadata
+                # phase and this line becomes the first body line.
+                in_metadata = False
+            body_lines.append(line)
+        # Trim leading/trailing blank lines from the body
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+        finding.body = "\n".join(body_lines)
         if _is_template_placeholder(finding.title, finding.metadata):
             continue
         findings.append(finding)
@@ -208,14 +200,18 @@ def _render_metadata(meta: dict[str, str]) -> Text:
     return out
 
 
-def _render_section(heading: str, body: str) -> Text:
-    """Render a ### section with a cyan ▸ header."""
-    out = Text()
-    out.append(f"▸ {heading}", style="bold cyan")
-    out.append("\n")
-    if body:
-        out.append(body)
-    return out
+def _render_body(body: str) -> "Markdown | Text":
+    """Render the raw finding body as Rich Markdown, or plain Text if empty.
+
+    Using Rich's Markdown gets us for free:
+      - '### Section' -> styled headers
+      - '**bold**' / '*italic*' / '`code`'
+      - Code fences with syntax highlighting
+      - Bullet lists
+    """
+    if not body.strip():
+        return Text("(empty body)", style="dim italic")
+    return Markdown(body, code_theme="ansi_dark")
 
 
 class Panel(Panel):  # type: ignore[misc]
@@ -321,28 +317,14 @@ class Panel(Panel):  # type: ignore[misc]
         header.append(pos, style="bold")
         header.append(" ◀ ▸", style="dim")
 
-        body = Text()
-        body.append_text(_render_metadata(cur.metadata))
+        metadata = _render_metadata(cur.metadata)
+        body_rendered = _render_body(cur.body)
 
-        # Prefer Summary + The Attack (user's spec). If neither is
-        # present, fall back to whichever legacy sections exist.
-        preferred = [s for s in ("Summary", "The Attack") if s in cur.sections]
-        if preferred:
-            shown = preferred
-        else:
-            shown = [s for s in _SECTION_ORDER if s in cur.sections]
+        # Scroll is applied by splitting the body text into lines and
+        # dropping the first N. For Markdown, we fall back to the raw
+        # string for scrolling (losing some styling on the cut portion).
+        if self._scroll > 0 and cur.body:
+            remaining_lines = cur.body.split("\n")[self._scroll :]
+            body_rendered = Markdown("\n".join(remaining_lines), code_theme="ansi_dark") if remaining_lines else Text("")
 
-        for section in shown:
-            body.append("\n")
-            body.append_text(_render_section(section, cur.sections[section]))
-            body.append("\n")
-
-        if not shown:
-            body.append("\n(no Summary / The Attack / What Was Found sections in this finding)\n", style="dim italic")
-
-        # Apply scroll offset by dropping the first N lines
-        if self._scroll > 0:
-            lines = body.split("\n")
-            body = Text("\n").join(lines[self._scroll :])
-
-        return Group(header, Rule(style="dim"), body)
+        return Group(header, Rule(style="dim"), metadata, Text(""), body_rendered)
