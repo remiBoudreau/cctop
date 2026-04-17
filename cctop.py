@@ -517,29 +517,13 @@ def render_accounts(
     out.append(header_text + (" " * pad_count), style=HEADER_STYLE)
     out.append("\n")
 
-    # Find the cursor's (group_start_index, group_size) so we know which
-    # row inside each group should receive the shifted bars+metadata.
-    cursor_group_start = -1
-    cursor_offset_in_group = -1
-    if 0 <= selected_row < len(rows):
-        _, _, cursor_offset_in_group, group_size = rows[selected_row]
-        cursor_group_start = selected_row - cursor_offset_in_group
-
     # Account-number counter only increments when we enter a new group.
     account_number = 0
-    last_account_id: int | None = None
 
     for flat_idx, (a, eng, row_offset, group_size) in enumerate(rows):
         is_group_start = row_offset == 0
         if is_group_start:
             account_number += 1
-        group_start_idx = flat_idx - row_offset
-        cursor_here = cursor_group_start == group_start_idx
-        # Which row within this group holds the bars+metadata?
-        # Default: row 0. If the cursor is in this group, the row the
-        # cursor is on (its offset) takes the bars.
-        bars_row = cursor_offset_in_group if cursor_here else 0
-        show_bars_here = row_offset == bars_row
         is_selected = flat_idx == selected_row
 
         # `#` column: only on the first row of each group
@@ -548,8 +532,8 @@ def render_accounts(
         else:
             out.append("   ")
 
-        # Account name + bars columns only on the "bars row" of the group
-        if show_bars_here:
+        # Account name + bars columns always on the group's first row
+        if is_group_start:
             out.append(f"{a.name:<{name_w}}  ", style=name_color(a))
 
             cd_secs = int(a.cooldown_remaining)
@@ -589,29 +573,23 @@ def render_accounts(
                 out.append("[" + " " * bw + "]", style="bright_black")
                 out.append(f" {'-':>{RESET_W}}", style="bright_black")
         else:
-            # Blank the entire account/bars/resets region so the engagement
-            # column alignment stays intact.
+            # Continuation rows (engagements 2..N of a multi-instance
+            # account) leave the Account/bars/resets region blank so the
+            # Engagement column alignment stays intact.
             blank_w = name_w + 2 + (bw + 2) + 1 + RESET_W + 2 + (bw + 2) + 1 + RESET_W
             out.append(" " * blank_w)
 
-        # Engagement column (always present, per row)
+        # Engagement column (always per row). Selected cell highlights green.
         eng_text = eng if eng else "—"
         eng_display = (eng_text[: ENG_W - 1] + "…") if len(eng_text) > ENG_W else eng_text
-        eng_style = "white" if eng else "bright_black"
+        if is_selected:
+            eng_style = "bold black on green"
+        elif eng:
+            eng_style = "white"
+        else:
+            eng_style = "bright_black"
         out.append(" ")
         out.append(f"{eng_display:<{ENG_W}}", style=eng_style)
-
-        # Selection highlight: re-style the whole built line by wrapping
-        # it in a reverse-video span. We approximate by prepending a
-        # cursor glyph since Rich Text doesn't allow easy whole-line
-        # background swap after the fact.
-        if is_selected:
-            # Prepend a visible ▶ at the very start of the line by
-            # modifying the just-appended line in place. Simpler: add a
-            # trailing marker at end-of-line.
-            pad = max(0, term_width - out.plain.split("\n")[-1].__len__() - 2)
-            out.append(" " * pad)
-            out.append(" ◀", style="bold yellow")
         out.append("\n")
 
     return out

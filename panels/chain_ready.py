@@ -71,18 +71,42 @@ def _cvss_color(score: str) -> str:
 
 
 def _parse_title(h2: str) -> str:
-    """Pull the readable vuln title out of a H2 like:
-    '## [F-29] [CHAIN-READY] [CRITICAL] JWT signature bypass → API access'
-    becomes 'JWT signature bypass → API access'.
+    """Pull the readable vuln title out of a H2.
+
+    Handles many real-world formats:
+      '## [F-29] [CHAIN-READY] [CRITICAL] JWT signature bypass'
+      '## F-56 ESCALATION: DYNAMICALLY VERIFIED — OAuth Code Leak [CHAIN-READY]'
+      '## F-74: Stored XSS via SVG File Upload [CHAIN-READY]'
     """
     text = h2.lstrip("#").strip()
-    # Strip one or more leading bracketed tokens
+    # Strip leading bracketed tokens (e.g. [F-29] [CHAIN-READY] [CRITICAL])
     while text.startswith("["):
         close = text.find("]")
         if close < 0:
             break
         text = text[close + 1 :].strip()
-    return text
+    # Strip a bare leading F-code prefix like 'F-56 ESCALATION:' or 'F-74:'
+    m = re.match(r"^F-\d+\s*[:—-]\s*", text)
+    if m:
+        text = text[m.end() :]
+    elif re.match(r"^F-\d+\s+", text):
+        text = re.sub(r"^F-\d+\s+", "", text)
+    # Strip trailing classification tags like '[CHAIN-READY]', '[HIGH]'
+    text = re.sub(r"\s*\[[^\]]+\]\s*$", "", text)
+    return text.strip()
+
+
+def _is_template_placeholder(title: str, meta: dict) -> bool:
+    """Detect the boilerplate template entry used in findings.md examples."""
+    if title == "Finding Title":
+        return True
+    if meta.get("CVSS", "").lstrip().startswith("X.X"):
+        return True
+    # Common placeholder patterns in the template block
+    for val in meta.values():
+        if "[SEVERITY]" in val or "[date]" in val:
+            return True
+    return False
 
 
 def _parse_findings(findings_md: Path) -> List[Finding]:
@@ -100,7 +124,11 @@ def _parse_findings(findings_md: Path) -> List[Finding]:
         if not lines:
             continue
         header = lines[0]
-        if not header.lstrip("#").strip().startswith("["):
+        # Accept any H2 (not just bracket-prefixed). We filter on the
+        # CHAIN-READY substring — real findings include it regardless of
+        # whether the header is '## [F-XX] [CHAIN-READY] ...' or
+        # '## F-56 ESCALATION ... [CHAIN-READY]'.
+        if not header.startswith("## "):
             continue
         if "CHAIN-READY" not in header:
             continue
@@ -137,6 +165,8 @@ def _parse_findings(findings_md: Path) -> List[Finding]:
             if current_section and current_section in _SECTION_SET:
                 section_lines.append(line)
         flush()
+        if _is_template_placeholder(finding.title, finding.metadata):
+            continue
         findings.append(finding)
     return findings
 
