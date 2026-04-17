@@ -559,9 +559,6 @@ def run_tui(
     from textual.app import App, ComposeResult
     from textual.widgets import Footer, Static
 
-    SORT_MODES = ["5h", "7d", "name"]
-    MANUAL_REFRESH_COOLDOWN = 15.0  # seconds — prevents rate-limit from refresh spam
-
     accounts = discover_profiles()
     if not accounts:
         print(f"No profiles with credentials under {PROFILES_DIR}", file=sys.stderr)
@@ -578,8 +575,6 @@ def run_tui(
         """
         ansi_color = True
         BINDINGS = [
-            ("f5,r", "refresh", "Refresh"),
-            ("f6,s", "sort", "Sort"),
             ("f10,q", "quit", "Quit"),
         ]
         # Textual auto-adds a command palette (ctrl+p) that shows as "palette"
@@ -595,7 +590,6 @@ def run_tui(
             self.interval_focus = interval_focus
             self.interval_blur = interval_blur
             self.system_hz = system_hz
-            self._last_manual_refresh = 0.0
 
         def compose(self) -> ComposeResult:
             yield Static(id="system")
@@ -607,7 +601,7 @@ def run_tui(
             # + palette show through.
             self.theme = "textual-ansi"
             self.title = "cctop"
-            self.sub_title = f"{len(self.accounts)} accounts · sort={self.sort_mode}"
+            self.sub_title = f"{len(self.accounts)} accounts"
             # Prime psutil with a real sample interval so the first render
             # has a baseline (bare `interval=None` returns 0.0 on first call).
             psutil.cpu_percent(interval=0.1)
@@ -666,35 +660,13 @@ def run_tui(
                         self.accounts, self.warn, self.crit, self.sort_mode, usable
                     )
                 )
-                self.sub_title = f"{len(self.accounts)} accounts · sort={self.sort_mode}"
+                self.sub_title = f"{len(self.accounts)} accounts"
             except Exception as e:
                 self.sub_title = f"accounts render error: {type(e).__name__}"
 
         def on_resize(self, event) -> None:
             # Re-render when the terminal is resized so bars reflow.
             self.call_after_refresh(self.update_display)
-
-        def action_refresh(self) -> None:
-            now = time.monotonic()
-            if now - self._last_manual_refresh < MANUAL_REFRESH_COOLDOWN:
-                remaining = MANUAL_REFRESH_COOLDOWN - (now - self._last_manual_refresh)
-                self.sub_title = f"cooldown: wait {remaining:.1f}s"
-                return
-            self._last_manual_refresh = now
-            # exclusive=True so only one manual refresh runs at a time.
-            self.run_worker(self._manual_refresh(), exclusive=True, group="manual_refresh")
-
-        async def _manual_refresh(self) -> None:
-            try:
-                await poll_all(self.accounts)
-            except Exception:
-                pass
-            self.update_display()
-
-        def action_sort(self) -> None:
-            idx = SORT_MODES.index(self.sort_mode) if self.sort_mode in SORT_MODES else 0
-            self.sort_mode = SORT_MODES[(idx + 1) % len(SORT_MODES)]
-            self.update_display()
 
     CctopApp().run()
     return 0
