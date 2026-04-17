@@ -59,9 +59,9 @@ DEFAULT_INTERVAL_FOCUS = 60
 DEFAULT_INTERVAL_BLUR = 300
 
 # System meter (CPU/Mem/Swp) refresh cadence. Decoupled from API polling
-# so local stats update in real time regardless of the 429-backoff state.
-# Default 60 Hz (every ~17 ms). Override with --system-hz.
-DEFAULT_SYSTEM_HZ = 60
+# so local stats update regardless of the 429-backoff state.
+# Default 1 Hz (htop-style). Override with --system-hz.
+DEFAULT_SYSTEM_HZ = 1
 
 IN_USE_WINDOW_SEC = 120
 HTTP_TIMEOUT = 10.0
@@ -716,7 +716,7 @@ def main() -> None:
     p.add_argument("--interval-blur", type=int, default=DEFAULT_INTERVAL_BLUR,
                    help="poll seconds when idle (default: 120)")
     p.add_argument("--system-hz", type=int, default=DEFAULT_SYSTEM_HZ,
-                   help=f"CPU/Mem/Swp meter refresh rate in Hz (default: {DEFAULT_SYSTEM_HZ}; try 120 for ultra-smooth)")
+                   help=f"CPU/Mem/Swp meter refresh rate in Hz (default: {DEFAULT_SYSTEM_HZ})")
     p.add_argument("--dump", action="store_true", help="print one snapshot and exit (no TUI)")
     args = p.parse_args()
 
