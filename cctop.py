@@ -890,10 +890,14 @@ def run_tui(
                     )
                 else:
                     self.selected_row = -1
+                # Hide the cursor marker when the panel isn't visible —
+                # selecting an engagement has no purpose if there's no
+                # panel to update.
+                effective_selected = self.selected_row if self.show_panel else -1
                 self.query_one("#accounts", Static).update(
                     render_accounts(
                         self.accounts, self.warn, self.crit, self.sort_mode,
-                        usable, self.engagement_map, self.selected_row,
+                        usable, self.engagement_map, effective_selected,
                         show_engagement_column=self.show_engagement_column,
                     )
                 )
@@ -921,7 +925,8 @@ def run_tui(
             self.call_after_refresh(self.update_display)
 
         def _apply_panel_visibility(self) -> None:
-            """Toggle panel/accounts CSS classes to match show_panel state."""
+            """Toggle panel/accounts CSS classes to match show_panel state.
+            Also refreshes the footer so disabled bindings disappear."""
             if not self.panel_enabled:
                 return
             try:
@@ -935,6 +940,12 @@ def run_tui(
             else:
                 panel_widget.add_class("hidden")
                 accounts_widget.add_class("fullheight")
+            # Nudge Textual to re-check action availability so the Footer
+            # reflects which bindings are live.
+            try:
+                self.refresh_bindings()
+            except Exception:
+                pass
 
         def action_toggle_panel(self) -> None:
             """F3: cycle through auto / force-show / force-hide."""
@@ -952,8 +963,23 @@ def run_tui(
 
         # ── cursor navigation ──────────────────────────────────────────
 
+        def check_action(self, action: str, parameters) -> bool | None:
+            """Gate cursor + panel actions on panel visibility.
+
+            Returning False removes the binding from the footer and
+            prevents the action from firing. When the panel is hidden
+            (narrow or short terminal), selecting an engagement has no
+            visible effect, so there's no point exposing the keys.
+
+            The F3 toggle always works so the user can force-show the
+            panel even when it would auto-hide.
+            """
+            if action in ("cursor_up", "cursor_down") or action.startswith("panel_"):
+                return self.show_panel
+            return True
+
         def action_cursor_up(self) -> None:
-            if not self._virtual_rows:
+            if not self.show_panel or not self._virtual_rows:
                 return
             self.selected_row = (self.selected_row - 1) % len(self._virtual_rows)
             self._sync_panel_engagement()
@@ -961,7 +987,7 @@ def run_tui(
             self.update_panel_only()
 
         def action_cursor_down(self) -> None:
-            if not self._virtual_rows:
+            if not self.show_panel or not self._virtual_rows:
                 return
             self.selected_row = (self.selected_row + 1) % len(self._virtual_rows)
             self._sync_panel_engagement()
