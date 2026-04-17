@@ -411,12 +411,57 @@ def render_system(warn: float, crit: float, term_width: int) -> Text:
     return out
 
 
+def build_account_rows(
+    accounts: list[AccountState],
+    engagement_map: dict[str, list[str]],
+    sort_mode: str,
+) -> list[tuple[AccountState, str | None, int, int]]:
+    """Return a flat list of virtual rows.
+
+    Each row = (account, engagement_name_or_None, row_offset_in_group, group_size).
+    A group is all rows that belong to one account — 1 row when the account has
+    no active engagement, otherwise one row per active engagement.
+
+    Row ordering respects `sort_mode`: accounts are sorted first, then each
+    account's engagements are listed in the order returned by the detector.
+    """
+    def pct(w: Optional[Window]) -> float:
+        return w.utilization if w else -1.0
+
+    def key_5h(a: AccountState) -> float:
+        return pct(a.snapshot.five_hour) if a.snapshot else -1.0
+
+    def key_7d(a: AccountState) -> float:
+        return pct(a.snapshot.seven_day) if a.snapshot else -1.0
+
+    if sort_mode == "5h":
+        ordered = sorted(accounts, key=lambda a: -key_5h(a))
+    elif sort_mode == "7d":
+        ordered = sorted(accounts, key=lambda a: -key_7d(a))
+    elif sort_mode == "name":
+        ordered = sorted(accounts, key=lambda a: a.name.lower())
+    else:
+        ordered = list(accounts)
+
+    rows: list[tuple[AccountState, str | None, int, int]] = []
+    for a in ordered:
+        engs = engagement_map.get(a.name, [])
+        if not engs:
+            rows.append((a, None, 0, 1))
+        else:
+            for i, eng in enumerate(engs):
+                rows.append((a, eng, i, len(engs)))
+    return rows
+
+
 def render_accounts(
     accounts: list[AccountState],
     warn: float,
     crit: float,
     sort_mode: str,
     term_width: int,
+    engagement_map: dict[str, list[str]] | None = None,
+    selected_row: int = -1,
 ) -> Text:
     now = datetime.now(timezone.utc)
 
@@ -429,97 +474,144 @@ def render_accounts(
     def key_7d(a: AccountState) -> float:
         return pct(a.snapshot.seven_day) if a.snapshot else -1.0
 
-    if sort_mode == "5h":
-        accounts = sorted(accounts, key=lambda a: -key_5h(a))
-    elif sort_mode == "7d":
-        accounts = sorted(accounts, key=lambda a: -key_7d(a))
-    elif sort_mode == "name":
-        accounts = sorted(accounts, key=lambda a: a.name.lower())
+    # Build the flat row list and compute group membership so the render
+    # loop can decide where to place bars within each group (row-shift
+    # behavior when the cursor is inside a multi-engagement group).
+    rows = build_account_rows(accounts, engagement_map or {}, sort_mode)
+    if not rows:
+        return Text("(no accounts)\n", style="dim")
 
     name_w = max((len(a.name) for a in accounts), default=8)
     name_w = max(name_w, 8)
 
-    # Row structure (char counts):
-    #   " #  "   = 4       (index + pad)
-    #   name_w             (name column, left-pad)
-    #   "  "    = 2        (pad)
-    #   "[" + bw + "]"     (5-hour bar)
-    #   " "     = 1        (pad)
-    #   RRRRRRRR = 8       (reset column — 8 chars to fit " HTTP 429" etc)
-    #   "  "    = 2        (pad)
-    #   "[" + bw + "]"     (7-day bar)
-    #   " "     = 1        (pad)
-    #   RRRRRRRR = 8       (reset column)
-    # Total = name_w + 30 + 2*bw
-    # Solve for bw: bw = (term_width - name_w - 31) / 2
-    # (-31 leaves a 1-char safety margin)
-    # No lower-bound floor on avail: narrow terminals get tiny bars rather
-    # than overflow. No upper cap: wide terminals get huge bars.
-    fixed = name_w + 30
+    ENG_W = 18   # engagement column width
+    RESET_W = 8  # reset/error column width
+
+    # Layout (char counts):
+    #   " # "   = 3       (index + pad)
+    #   name_w            (name column)
+    #   "  "    = 2
+    #   "[" + bw + "]"    (5-hour bar)
+    #   " "     = 1
+    #   RRRRRRRR = 8      (reset)
+    #   "  "    = 2
+    #   "[" + bw + "]"    (7-day bar)
+    #   " "     = 1
+    #   RRRRRRRR = 8      (reset)
+    #   " "     = 1
+    #   ENG_W             (engagement column)
+    # Total fixed (non-bar) = name_w + 30 + ENG_W + 1
+    fixed = name_w + 30 + ENG_W + 1
     avail = term_width - fixed - 1
     bw = max(5, avail // 2)
 
-    RESET_W = 8  # width of the reset/error column after each bar
-
     out = Text()
-    # htop-style separator: a full-width colored bar with black text that
-    # visually separates the system meters (above) from the account list
-    # (below). We render it as a single styled span and pad to term_width
-    # with background-colored spaces so the stripe extends across the
-    # whole terminal.
     HEADER_STYLE = "black on cyan bold"
     header_text = (
-        f" #  {'Account':<{name_w}}  "
+        f" # {'Account':<{name_w}}  "
         f"{'5-hour':<{bw + 2}} {'reset':>{RESET_W}}"
         f"  {'7-day':<{bw + 2}} {'reset':>{RESET_W}}"
+        f" {'Engagement':<{ENG_W}}"
     )
-    # Pad with styled spaces so the stripe fills the full row
     pad_count = max(0, term_width - len(header_text))
     out.append(header_text + (" " * pad_count), style=HEADER_STYLE)
     out.append("\n")
 
-    for i, a in enumerate(accounts, start=1):
-        out.append(f"{i:2d}  ")
-        out.append(f"{a.name:<{name_w}}  ", style=name_color(a))
+    # Find the cursor's (group_start_index, group_size) so we know which
+    # row inside each group should receive the shifted bars+metadata.
+    cursor_group_start = -1
+    cursor_offset_in_group = -1
+    if 0 <= selected_row < len(rows):
+        _, _, cursor_offset_in_group, group_size = rows[selected_row]
+        cursor_group_start = selected_row - cursor_offset_in_group
 
-        # Cooldown state: if rate-limited, render "429 Ns/Nm/Nh" in the 5h
-        # reset column instead of the reset time, but KEEP showing the
-        # last-known good bars so the user sees stale data while waiting.
-        cd_secs = int(a.cooldown_remaining)
-        if cd_secs > 0:
-            if cd_secs < 60:
-                cd_display = f"429 {cd_secs}s"
-            elif cd_secs < 3600:
-                cd_display = f"429 {cd_secs // 60}m"
-            else:
-                cd_display = f"429 {cd_secs // 3600}h"
+    # Account-number counter only increments when we enter a new group.
+    account_number = 0
+    last_account_id: int | None = None
 
-        snap = a.snapshot
-        # 5-hour bar
-        if snap and snap.five_hour:
-            out.append_text(make_bar(snap.five_hour.utilization, bw, warn, crit))
-            out.append(" ")
+    for flat_idx, (a, eng, row_offset, group_size) in enumerate(rows):
+        is_group_start = row_offset == 0
+        if is_group_start:
+            account_number += 1
+        group_start_idx = flat_idx - row_offset
+        cursor_here = cursor_group_start == group_start_idx
+        # Which row within this group holds the bars+metadata?
+        # Default: row 0. If the cursor is in this group, the row the
+        # cursor is on (its offset) takes the bars.
+        bars_row = cursor_offset_in_group if cursor_here else 0
+        show_bars_here = row_offset == bars_row
+        is_selected = flat_idx == selected_row
+
+        # `#` column: only on the first row of each group
+        if is_group_start:
+            out.append(f"{account_number:2d} ")
+        else:
+            out.append("   ")
+
+        # Account name + bars columns only on the "bars row" of the group
+        if show_bars_here:
+            out.append(f"{a.name:<{name_w}}  ", style=name_color(a))
+
+            cd_secs = int(a.cooldown_remaining)
+            cd_display = ""
             if cd_secs > 0:
-                out.append(f"{cd_display:>{RESET_W}}", style="bright_black")
+                if cd_secs < 60:
+                    cd_display = f"429 {cd_secs}s"
+                elif cd_secs < 3600:
+                    cd_display = f"429 {cd_secs // 60}m"
+                else:
+                    cd_display = f"429 {cd_secs // 3600}h"
+
+            snap = a.snapshot
+            # 5-hour bar
+            if snap and snap.five_hour:
+                out.append_text(make_bar(snap.five_hour.utilization, bw, warn, crit))
+                out.append(" ")
+                if cd_secs > 0:
+                    out.append(f"{cd_display:>{RESET_W}}", style="bright_black")
+                else:
+                    delta = snap.five_hour.resets_at - now
+                    out.append(f"{format_countdown(delta)[:RESET_W]:>{RESET_W}}",
+                               style=countdown_style(delta))
             else:
-                delta = snap.five_hour.resets_at - now
+                out.append("[" + " " * bw + "]", style="bright_black")
+                err_text = (cd_display if cd_secs > 0 else (a.last_error or "-"))[:RESET_W]
+                out.append(f" {err_text:>{RESET_W}}", style="bright_black")
+            out.append("  ")
+            # 7-day bar
+            if snap and snap.seven_day:
+                out.append_text(make_bar(snap.seven_day.utilization, bw, warn, crit))
+                out.append(" ")
+                delta = snap.seven_day.resets_at - now
                 out.append(f"{format_countdown(delta)[:RESET_W]:>{RESET_W}}",
                            style=countdown_style(delta))
+            else:
+                out.append("[" + " " * bw + "]", style="bright_black")
+                out.append(f" {'-':>{RESET_W}}", style="bright_black")
         else:
-            out.append("[" + " " * bw + "]", style="bright_black")
-            err_text = (cd_display if cd_secs > 0 else (a.last_error or "-"))[:RESET_W]
-            out.append(f" {err_text:>{RESET_W}}", style="bright_black")
-        out.append("  ")
-        # 7-day bar
-        if snap and snap.seven_day:
-            out.append_text(make_bar(snap.seven_day.utilization, bw, warn, crit))
-            out.append(" ")
-            delta = snap.seven_day.resets_at - now
-            out.append(f"{format_countdown(delta)[:RESET_W]:>{RESET_W}}",
-                       style=countdown_style(delta))
-        else:
-            out.append("[" + " " * bw + "]", style="bright_black")
-            out.append(f" {'-':>{RESET_W}}", style="bright_black")
+            # Blank the entire account/bars/resets region so the engagement
+            # column alignment stays intact.
+            blank_w = name_w + 2 + (bw + 2) + 1 + RESET_W + 2 + (bw + 2) + 1 + RESET_W
+            out.append(" " * blank_w)
+
+        # Engagement column (always present, per row)
+        eng_text = eng if eng else "—"
+        eng_display = (eng_text[: ENG_W - 1] + "…") if len(eng_text) > ENG_W else eng_text
+        eng_style = "white" if eng else "bright_black"
+        out.append(" ")
+        out.append(f"{eng_display:<{ENG_W}}", style=eng_style)
+
+        # Selection highlight: re-style the whole built line by wrapping
+        # it in a reverse-video span. We approximate by prepending a
+        # cursor glyph since Rich Text doesn't allow easy whole-line
+        # background swap after the fact.
+        if is_selected:
+            # Prepend a visible ▶ at the very start of the line by
+            # modifying the just-appended line in place. Simpler: add a
+            # trailing marker at end-of-line.
+            pad = max(0, term_width - out.plain.split("\n")[-1].__len__() - 2)
+            out.append(" " * pad)
+            out.append(" ◀", style="bold yellow")
         out.append("\n")
 
     return out
@@ -529,6 +621,8 @@ def render_accounts(
 
 
 def dump_mode(warn: float, crit: float, sort_mode: str) -> int:
+    from engagements import active_engagements_by_profile
+
     accounts = discover_profiles()
     if not accounts:
         print(f"No profiles with credentials under {PROFILES_DIR}", file=sys.stderr)
@@ -541,7 +635,8 @@ def dump_mode(warn: float, crit: float, sort_mode: str) -> int:
     width = console.width
     console.print(render_system(warn, crit, width))
     console.print()
-    console.print(render_accounts(accounts, warn, crit, sort_mode, width))
+    eng_map = active_engagements_by_profile()
+    console.print(render_accounts(accounts, warn, crit, sort_mode, width, eng_map, -1))
     return 0
 
 
@@ -555,30 +650,55 @@ def run_tui(
     interval_focus: int,
     interval_blur: int,
     system_hz: int,
+    panel_name: str,
+    panel_path: Optional[str],
 ) -> int:
     from textual.app import App, ComposeResult
+    from textual.binding import Binding
     from textual.widgets import Footer, Static
+
+    import panels as panels_module
+    from engagements import active_engagements_by_profile, engagement_dir
 
     accounts = discover_profiles()
     if not accounts:
         print(f"No profiles with credentials under {PROFILES_DIR}", file=sys.stderr)
         return 2
 
+    # Load the panel class (from registry or --panel-path file)
+    if panel_path:
+        PanelCls = panels_module.load_panel_from_path(Path(panel_path))
+    else:
+        PanelCls = panels_module.load_panel(panel_name)
+    panel = PanelCls()
+
+    # Build Textual bindings from the panel's keybindings
+    panel_bindings = []
+    for keys, action, label in panel.keybindings():
+        panel_bindings.append(Binding(keys, f"panel_{action}", label))
+
+    # Show the panel's pane only if the panel is non-null
+    show_panel = not isinstance(panel, panels_module.base.NoPanel)
+
     class CctopApp(App):
-        # The built-in `textual-ansi` theme defers ALL colors to the
-        # terminal's palette, including the background — so we inherit
-        # whatever bg the user's terminal is set to (exactly like htop).
-        CSS = """
+        CSS_TEMPLATE_WITH_PANEL = """
+        Screen { layout: vertical; }
+        #system { height: 3; padding: 0 1; }
+        #accounts { height: auto; max-height: 50%; padding: 0 1; }
+        #panel { height: 1fr; padding: 0 1; }
+        """
+        CSS_TEMPLATE_NO_PANEL = """
         Screen { layout: vertical; }
         #system { height: 3; padding: 0 1; }
         #accounts { height: 1fr; padding: 0 1; }
         """
+        CSS = CSS_TEMPLATE_WITH_PANEL if show_panel else CSS_TEMPLATE_NO_PANEL
         ansi_color = True
         BINDINGS = [
             ("f10,q", "quit", "Quit"),
-        ]
-        # Textual auto-adds a command palette (ctrl+p) that shows as "palette"
-        # in the footer. We don't need it for a single-screen monitor tool.
+            ("up,k", "cursor_up", "Up"),
+            ("down,j", "cursor_down", "Down"),
+        ] + panel_bindings
         ENABLE_COMMAND_PALETTE = False
 
         def __init__(self) -> None:
@@ -590,56 +710,102 @@ def run_tui(
             self.interval_focus = interval_focus
             self.interval_blur = interval_blur
             self.system_hz = system_hz
+            self.panel = panel
+            self.show_panel = show_panel
+            self.engagement_map: dict[str, list[str]] = {}
+            self.selected_row = 0 if show_panel else -1
+            self._virtual_rows: list = []
 
         def compose(self) -> ComposeResult:
             yield Static(id="system")
             yield Static(id="accounts")
+            if self.show_panel:
+                yield Static(id="panel")
             yield Footer()
 
         def on_mount(self) -> None:
-            # Switch to the ANSI theme so the terminal's native background
-            # + palette show through.
             self.theme = "textual-ansi"
             self.title = "cctop"
             self.sub_title = f"{len(self.accounts)} accounts"
-            # Prime psutil with a real sample interval so the first render
-            # has a baseline (bare `interval=None` returns 0.0 on first call).
             psutil.cpu_percent(interval=0.1)
-            # Initial render deferred — widget sizes aren't populated until
-            # after the first layout pass. call_after_refresh waits for that.
+            # Initial engagement scan + selection sync before first render
+            self._refresh_engagement_map()
+            self._sync_panel_engagement()
             self.call_after_refresh(self.update_display)
             self.run_worker(self._refresh_loop(), exclusive=True, group="api")
             self.run_worker(self._ui_refresh_loop(), exclusive=True, group="ui")
+            self.run_worker(self._engagement_loop(), exclusive=True, group="eng")
 
         async def _refresh_loop(self) -> None:
-            # API polling loop: hits Anthropic's /usage endpoint, updates
-            # account snapshots, then refreshes the accounts display.
-            # Interval governed by focus/blur and 429 backoff — slow by design.
             while True:
                 try:
                     await poll_all(self.accounts)
                 except Exception:
-                    pass  # never kill the loop
+                    pass
                 self.call_after_refresh(self.update_accounts_only)
                 any_in_use = any(a.in_use for a in self.accounts)
                 interval = self.interval_focus if any_in_use else self.interval_blur
                 await asyncio.sleep(interval)
 
         async def _ui_refresh_loop(self) -> None:
-            # System meter (CPU/Mem/Swp) fast-refresh loop. Decoupled from
-            # the API poller so local stats animate in real time regardless
-            # of 429 backoff or account poll cadence. Default 60 Hz.
             period = 1.0 / max(1, self.system_hz)
             while True:
                 self.call_after_refresh(self.update_system_only)
                 await asyncio.sleep(period)
 
+        async def _engagement_loop(self) -> None:
+            # Re-scan /proc for active engagements every 2 seconds. Cheap
+            # (reads /proc/*/environ); no API involvement.
+            while True:
+                try:
+                    changed = self._refresh_engagement_map()
+                except Exception:
+                    changed = False
+                # Panel may also have per-tick state changes (findings.md mtime)
+                try:
+                    panel_changed = self.panel.on_tick()
+                except Exception:
+                    panel_changed = False
+                if changed:
+                    self._sync_panel_engagement()
+                if changed or panel_changed:
+                    self.call_after_refresh(self.update_accounts_only)
+                    if self.show_panel:
+                        self.call_after_refresh(self.update_panel_only)
+                await asyncio.sleep(2.0)
+
+        def _refresh_engagement_map(self) -> bool:
+            """Rescan /proc for running claude processes. Return True if changed."""
+            new_map = active_engagements_by_profile()
+            if new_map == self.engagement_map:
+                return False
+            self.engagement_map = new_map
+            # Rebuild virtual rows and clamp selection
+            self._virtual_rows = build_account_rows(
+                self.accounts, self.engagement_map, self.sort_mode
+            )
+            if self._virtual_rows:
+                self.selected_row = max(0, min(self.selected_row, len(self._virtual_rows) - 1))
+            else:
+                self.selected_row = -1
+            return True
+
+        def _sync_panel_engagement(self) -> None:
+            """Inform the panel which engagement is currently selected."""
+            if not self.show_panel or not self._virtual_rows or self.selected_row < 0:
+                self.panel.on_engagement_change(None, None)
+                return
+            _, eng, _, _ = self._virtual_rows[self.selected_row]
+            if eng:
+                self.panel.on_engagement_change(eng, engagement_dir(eng))
+            else:
+                self.panel.on_engagement_change(None, None)
+
         def update_display(self) -> None:
-            # Full redraw: system bar + accounts table. Called after API polls
-            # and on resize. The fast _ui_refresh_loop calls update_system_only
-            # for high-Hz refresh without re-rendering the accounts table.
             self.update_system_only()
             self.update_accounts_only()
+            if self.show_panel:
+                self.update_panel_only()
 
         def update_system_only(self) -> None:
             try:
@@ -655,18 +821,74 @@ def run_tui(
             try:
                 term_w = self.size.width or 80
                 usable = max(40, term_w - 2)
+                # Keep virtual rows in sync for cursor clamping even when
+                # the map hasn't changed (first render before eng_loop ticks)
+                self._virtual_rows = build_account_rows(
+                    self.accounts, self.engagement_map, self.sort_mode
+                )
+                if self._virtual_rows:
+                    self.selected_row = max(
+                        0, min(self.selected_row, len(self._virtual_rows) - 1)
+                    )
+                else:
+                    self.selected_row = -1
                 self.query_one("#accounts", Static).update(
                     render_accounts(
-                        self.accounts, self.warn, self.crit, self.sort_mode, usable
+                        self.accounts, self.warn, self.crit, self.sort_mode,
+                        usable, self.engagement_map, self.selected_row,
                     )
                 )
-                self.sub_title = f"{len(self.accounts)} accounts"
+                self.sub_title = f"{len(self.accounts)} accounts · panel={self.panel.name}"
             except Exception as e:
                 self.sub_title = f"accounts render error: {type(e).__name__}"
 
+        def update_panel_only(self) -> None:
+            if not self.show_panel:
+                return
+            try:
+                term_w = self.size.width or 80
+                term_h = self.size.height or 24
+                usable_w = max(40, term_w - 2)
+                # Account pane ~half of screen, panel ~half.
+                panel_h = max(10, term_h // 2 - 2)
+                self.query_one("#panel", Static).update(
+                    self.panel.render(usable_w, panel_h)
+                )
+            except Exception as e:
+                self.sub_title = f"panel render error: {type(e).__name__}"
+
         def on_resize(self, event) -> None:
-            # Re-render when the terminal is resized so bars reflow.
             self.call_after_refresh(self.update_display)
+
+        # ── cursor navigation ──────────────────────────────────────────
+
+        def action_cursor_up(self) -> None:
+            if not self._virtual_rows:
+                return
+            self.selected_row = (self.selected_row - 1) % len(self._virtual_rows)
+            self._sync_panel_engagement()
+            self.update_accounts_only()
+            self.update_panel_only()
+
+        def action_cursor_down(self) -> None:
+            if not self._virtual_rows:
+                return
+            self.selected_row = (self.selected_row + 1) % len(self._virtual_rows)
+            self._sync_panel_engagement()
+            self.update_accounts_only()
+            self.update_panel_only()
+
+        # ── panel action dispatch ──────────────────────────────────────
+
+        def __getattr__(self, name: str):
+            # Route action_panel_<x> to the loaded panel's action(x) method.
+            if name.startswith("action_panel_"):
+                action = name[len("action_panel_"):]
+                def handler() -> None:
+                    if self.panel.action(action):
+                        self.update_panel_only()
+                return handler
+            raise AttributeError(name)
 
     CctopApp().run()
     return 0
@@ -689,12 +911,20 @@ def main() -> None:
                    help="poll seconds when idle (default: 120)")
     p.add_argument("--system-hz", type=int, default=DEFAULT_SYSTEM_HZ,
                    help=f"CPU/Mem/Swp meter refresh rate in Hz (default: {DEFAULT_SYSTEM_HZ})")
+    p.add_argument("--panel", default="chain_ready",
+                   help="bottom panel: chain_ready | none (default: chain_ready)")
+    p.add_argument("--panel-path", default=None,
+                   help="load a user-written panel from a Python file (overrides --panel)")
     p.add_argument("--dump", action="store_true", help="print one snapshot and exit (no TUI)")
     args = p.parse_args()
 
     if args.dump:
         sys.exit(dump_mode(args.warn, args.crit, args.sort))
-    sys.exit(run_tui(args.warn, args.crit, args.sort, args.interval_focus, args.interval_blur, args.system_hz))
+    sys.exit(run_tui(
+        args.warn, args.crit, args.sort,
+        args.interval_focus, args.interval_blur, args.system_hz,
+        args.panel, args.panel_path,
+    ))
 
 
 if __name__ == "__main__":
