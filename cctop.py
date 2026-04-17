@@ -60,8 +60,8 @@ DEFAULT_INTERVAL_BLUR = 300
 
 # System meter (CPU/Mem/Swp) refresh cadence. Decoupled from API polling
 # so local stats update regardless of the 429-backoff state.
-# Default 2 Hz (every 500 ms). Override with --system-hz.
-DEFAULT_SYSTEM_HZ = 2
+# Default 1 Hz. Override with --system-hz.
+DEFAULT_SYSTEM_HZ = 1
 
 # Minimum terminal dimensions to show rich UI features.
 # Below PANEL_MIN_HEIGHT rows: hide bottom panel (too short to be useful).
@@ -572,7 +572,8 @@ def render_accounts(
             default=0,
         )
         ENG_W = max(12, min(24, max_eng_len + 2))
-        eng_section_width = ENG_W + 1  # leading space before engagement
+        # 2 (leading gap) + ENG_W + 2 (trailing ◀ / blank)
+        eng_section_width = 2 + ENG_W + 2
     else:
         ENG_W = 0
         eng_section_width = 0
@@ -583,31 +584,51 @@ def render_accounts(
     show_stats = show_engagement_column and engagement_stats is not None
     CPU_W = 5  # "99.9%" / " 100%" — 5 chars
     MEM_W = 5
-    stats_section_width = (1 + CPU_W + 1 + MEM_W) if show_stats else 0
+    # 2-space gap before CPU, 2-space gap between CPU and MEM, 2-space gap after MEM.
+    stats_section_width = (2 + CPU_W + 2 + MEM_W) if show_stats else 0
 
     # Bar width: divide remaining space between the two bars, but cap so
     # very wide terminals don't produce 100+-char bars that look stretched.
+    # Fixed (non-BAR-FILL) cols per row (bars' brackets included):
+    #   " # "      3    index column
+    #   name_w         name column
+    #   "   "      3    gap before 5h bar
+    #   "["        1    5h bar open bracket
+    #   bw              5h bar fill (variable)
+    #   "]"        1    5h bar close bracket
+    #   "  "       2    gap
+    #   RRRRRRRR   8    5h reset
+    #   "   "      3    gap
+    #   "["        1    7d bar open bracket
+    #   bw              7d bar fill (variable)
+    #   "]"        1    7d bar close bracket
+    #   "  "       2    gap
+    #   RRRRRRRR   8    7d reset
+    #   = non-bar-fill fixed: 3 + 3 + 1 + 1 + 2 + 8 + 3 + 1 + 1 + 2 + 8 = 33
+    #   (plus name_w, stats_section_width, eng_section_width)
     MAX_BW = 40
-    fixed = name_w + 30 + stats_section_width + eng_section_width
-    avail = term_width - fixed - 1
+    fixed = name_w + 33 + stats_section_width + eng_section_width
+    avail = term_width - fixed
     bw = max(5, min(MAX_BW, avail // 2))
     # Extra unused width (when terminal is wider than our max layout) goes
     # to trailing blanks on each row so the header stripe still spans the
     # whole terminal.
     used_cols = fixed + 2 * bw
-    trailing_pad = max(0, term_width - used_cols - 1)
+    trailing_pad = max(0, term_width - used_cols)
 
     out = Text()
     HEADER_STYLE = "black on cyan bold"
     header_text = (
-        f" # {'Account':<{name_w}}  "
-        f"{'5-hour':<{bw + 2}} {'reset':>{RESET_W}}"
-        f"  {'7-day':<{bw + 2}} {'reset':>{RESET_W}}"
+        f" # {'Account':<{name_w}}   "
+        f"{'5-hour':<{bw + 2}}  {'reset':>{RESET_W}}"
+        f"   {'7-day':<{bw + 2}}  {'reset':>{RESET_W}}"
     )
     if show_stats:
-        header_text += f" {'CPU':>{CPU_W}} {'MEM':>{MEM_W}}"
+        header_text += f"  {'CPU':>{CPU_W}}  {'MEM':>{MEM_W}}"
     if show_engagement_column:
-        header_text += f" {'Engagement':<{ENG_W}}"
+        # 2 leading spaces + Engagement header + 2 trailing (reserving
+        # the ◀ selection marker column so header stripe aligns with rows)
+        header_text += f"  {'Engagement':<{ENG_W}}  "
     pad_count = max(0, term_width - len(header_text))
     out.append(header_text + (" " * pad_count), style=HEADER_STYLE)
     out.append("\n")
@@ -629,7 +650,7 @@ def render_accounts(
 
         # Account name + bars columns always on the group's first row
         if is_group_start:
-            out.append(f"{a.name:<{name_w}}  ", style=name_color(a))
+            out.append(f"{a.name:<{name_w}}   ", style=name_color(a))
 
             cd_secs = int(a.cooldown_remaining)
             cd_display = ""
@@ -645,7 +666,7 @@ def render_accounts(
             # 5-hour bar
             if snap and snap.five_hour:
                 out.append_text(make_bar(snap.five_hour.utilization, bw, warn, crit))
-                out.append(" ")
+                out.append("  ")
                 if cd_secs > 0:
                     out.append(f"{cd_display:>{RESET_W}}", style="bright_black")
                 else:
@@ -655,23 +676,24 @@ def render_accounts(
             else:
                 out.append("[" + " " * bw + "]", style="bright_black")
                 err_text = (cd_display if cd_secs > 0 else (a.last_error or "-"))[:RESET_W]
-                out.append(f" {err_text:>{RESET_W}}", style="bright_black")
-            out.append("  ")
+                out.append(f"  {err_text:>{RESET_W}}", style="bright_black")
+            out.append("   ")
             # 7-day bar
             if snap and snap.seven_day:
                 out.append_text(make_bar(snap.seven_day.utilization, bw, warn, crit))
-                out.append(" ")
+                out.append("  ")
                 delta = snap.seven_day.resets_at - now
                 out.append(f"{format_countdown(delta)[:RESET_W]:>{RESET_W}}",
                            style=countdown_style(delta))
             else:
                 out.append("[" + " " * bw + "]", style="bright_black")
-                out.append(f" {'-':>{RESET_W}}", style="bright_black")
+                out.append(f"  {'-':>{RESET_W}}", style="bright_black")
         else:
             # Continuation rows (engagements 2..N of a multi-instance
             # account) leave the Account/bars/resets region blank so the
             # Engagement column alignment stays intact.
-            blank_w = name_w + 2 + (bw + 2) + 1 + RESET_W + 2 + (bw + 2) + 1 + RESET_W
+            # Width = name_w + 3 + (bw+2) + 2 + RESET_W + 3 + (bw+2) + 2 + RESET_W
+            blank_w = name_w + 3 + (bw + 2) + 2 + RESET_W + 3 + (bw + 2) + 2 + RESET_W
             out.append(" " * blank_w)
 
         # CPU/Mem columns (per-engagement). Blank when the row has no
@@ -692,12 +714,12 @@ def render_accounts(
                     else "yellow" if mem >= warn
                     else "green"
                 )
-                out.append(" ")
+                out.append("  ")
                 out.append(f"{cpu_str:>{CPU_W}}", style=cpu_style)
-                out.append(" ")
+                out.append("  ")
                 out.append(f"{mem_str:>{MEM_W}}", style=mem_style)
             else:
-                out.append(" " + (" " * CPU_W) + " " + (" " * MEM_W))
+                out.append("  " + (" " * CPU_W) + "  " + (" " * MEM_W))
 
         # Engagement column (if visible). Selected cell = green text
         # + trailing ◀ marker. Background stays terminal default.
@@ -710,7 +732,7 @@ def render_accounts(
                 eng_style = "white"
             else:
                 eng_style = "bright_black"
-            out.append(" ")
+            out.append("  ")
             out.append(f"{eng_display:<{ENG_W}}", style=eng_style)
             if is_selected:
                 out.append(" ◀", style="bold green")
@@ -886,12 +908,11 @@ def run_tui(
                 await asyncio.sleep(period)
 
         async def _stats_loop(self) -> None:
-            """Refresh per-engagement CPU/Mem stats every 2 seconds.
+            """Refresh per-engagement CPU/Mem stats at 1 Hz.
 
             psutil.cpu_percent() returns a delta since last call, so
-            ticking regularly gives meaningful numbers. Runs alongside
-            the engagement scan (same cadence) but computes fresh
-            process stats even when the engagement list hasn't changed.
+            ticking regularly gives meaningful numbers. 1 Hz matches
+            htop's default and the top-panel system meter cadence.
             """
             while True:
                 try:
@@ -902,7 +923,7 @@ def run_tui(
                 except Exception:
                     pass
                 self.call_after_refresh(self.update_accounts_only)
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.0)
 
         async def _engagement_loop(self) -> None:
             # Re-scan /proc for active engagements every 2 seconds. Cheap
