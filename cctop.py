@@ -579,17 +579,20 @@ def render_accounts(
             blank_w = name_w + 2 + (bw + 2) + 1 + RESET_W + 2 + (bw + 2) + 1 + RESET_W
             out.append(" " * blank_w)
 
-        # Engagement column (always per row). Selected cell highlights green.
+        # Engagement column (always per row). Selected cell = green text
+        # + trailing ◀ marker. Background stays the terminal default.
         eng_text = eng if eng else "—"
         eng_display = (eng_text[: ENG_W - 1] + "…") if len(eng_text) > ENG_W else eng_text
         if is_selected:
-            eng_style = "bold black on green"
+            eng_style = "bold green"
         elif eng:
             eng_style = "white"
         else:
             eng_style = "bright_black"
         out.append(" ")
         out.append(f"{eng_display:<{ENG_W}}", style=eng_style)
+        if is_selected:
+            out.append(" ◀", style="bold green")
         out.append("\n")
 
     return out
