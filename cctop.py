@@ -58,6 +58,11 @@ DEFAULT_CRIT = 85.0
 DEFAULT_INTERVAL_FOCUS = 60
 DEFAULT_INTERVAL_BLUR = 300
 
+# System meter (CPU/Mem/Swp) refresh cadence. Decoupled from API polling
+# so local stats update in real time regardless of the 429-backoff state.
+# Default 60 Hz (every ~17 ms). Override with --system-hz.
+DEFAULT_SYSTEM_HZ = 60
+
 IN_USE_WINDOW_SEC = 120
 HTTP_TIMEOUT = 10.0
 BAR_WIDTH_SYSTEM = 20
@@ -363,11 +368,13 @@ def name_color(account: AccountState) -> str:
 
 
 def render_system(warn: float, crit: float, term_width: int) -> Text:
-    # Use a small sample interval so each render produces a meaningful
-    # delta. `interval=None` returns 0.0 on the first call and can return
-    # stale/zero values when the interval between calls is too short
-    # (which happens during Textual's initial layout pass).
-    cpu = psutil.cpu_percent(interval=0.05)
+    # Non-blocking sample: returns the CPU delta since the last call.
+    # The app primes psutil with a real sample at startup and calls this
+    # function at a high cadence (default 60 Hz) from the UI loop, so the
+    # delta window is always recent. A blocking `interval=0.05` would
+    # stall each render by 50 ms, which caps the effective UI rate at
+    # ~20 Hz and wastes 50 ms of CPU per tick even when nothing changed.
+    cpu = psutil.cpu_percent(interval=None)
     vm = psutil.virtual_memory()
     swap = psutil.swap_memory()
     load1, load5, load15 = os.getloadavg()
@@ -547,6 +554,7 @@ def run_tui(
     sort_mode: str,
     interval_focus: int,
     interval_blur: int,
+    system_hz: int,
 ) -> int:
     from textual.app import App, ComposeResult
     from textual.widgets import Footer, Static
@@ -586,6 +594,7 @@ def run_tui(
             self.sort_mode = sort_mode
             self.interval_focus = interval_focus
             self.interval_blur = interval_blur
+            self.system_hz = system_hz
             self._last_manual_refresh = 0.0
 
         def compose(self) -> ComposeResult:
@@ -605,28 +614,53 @@ def run_tui(
             # Initial render deferred — widget sizes aren't populated until
             # after the first layout pass. call_after_refresh waits for that.
             self.call_after_refresh(self.update_display)
-            self.run_worker(self._refresh_loop(), exclusive=True)
+            self.run_worker(self._refresh_loop(), exclusive=True, group="api")
+            self.run_worker(self._ui_refresh_loop(), exclusive=True, group="ui")
 
         async def _refresh_loop(self) -> None:
+            # API polling loop: hits Anthropic's /usage endpoint, updates
+            # account snapshots, then refreshes the accounts display.
+            # Interval governed by focus/blur and 429 backoff — slow by design.
             while True:
                 try:
                     await poll_all(self.accounts)
                 except Exception:
                     pass  # never kill the loop
-                self.call_after_refresh(self.update_display)
+                self.call_after_refresh(self.update_accounts_only)
                 any_in_use = any(a.in_use for a in self.accounts)
                 interval = self.interval_focus if any_in_use else self.interval_blur
                 await asyncio.sleep(interval)
 
+        async def _ui_refresh_loop(self) -> None:
+            # System meter (CPU/Mem/Swp) fast-refresh loop. Decoupled from
+            # the API poller so local stats animate in real time regardless
+            # of 429 backoff or account poll cadence. Default 60 Hz.
+            period = 1.0 / max(1, self.system_hz)
+            while True:
+                self.call_after_refresh(self.update_system_only)
+                await asyncio.sleep(period)
+
         def update_display(self) -> None:
+            # Full redraw: system bar + accounts table. Called after API polls
+            # and on resize. The fast _ui_refresh_loop calls update_system_only
+            # for high-Hz refresh without re-rendering the accounts table.
+            self.update_system_only()
+            self.update_accounts_only()
+
+        def update_system_only(self) -> None:
             try:
-                # Use the App/Screen width (always current after layout)
-                # and subtract CSS padding (padding: 0 1 = 2 chars per widget).
                 term_w = self.size.width or 80
                 usable = max(40, term_w - 2)
                 self.query_one("#system", Static).update(
                     render_system(self.warn, self.crit, usable)
                 )
+            except Exception as e:
+                self.sub_title = f"system render error: {type(e).__name__}"
+
+        def update_accounts_only(self) -> None:
+            try:
+                term_w = self.size.width or 80
+                usable = max(40, term_w - 2)
                 self.query_one("#accounts", Static).update(
                     render_accounts(
                         self.accounts, self.warn, self.crit, self.sort_mode, usable
@@ -634,7 +668,7 @@ def run_tui(
                 )
                 self.sub_title = f"{len(self.accounts)} accounts · sort={self.sort_mode}"
             except Exception as e:
-                self.sub_title = f"render error: {type(e).__name__}"
+                self.sub_title = f"accounts render error: {type(e).__name__}"
 
         def on_resize(self, event) -> None:
             # Re-render when the terminal is resized so bars reflow.
@@ -681,12 +715,14 @@ def main() -> None:
                    help="poll seconds when any account in use (default: 30)")
     p.add_argument("--interval-blur", type=int, default=DEFAULT_INTERVAL_BLUR,
                    help="poll seconds when idle (default: 120)")
+    p.add_argument("--system-hz", type=int, default=DEFAULT_SYSTEM_HZ,
+                   help=f"CPU/Mem/Swp meter refresh rate in Hz (default: {DEFAULT_SYSTEM_HZ}; try 120 for ultra-smooth)")
     p.add_argument("--dump", action="store_true", help="print one snapshot and exit (no TUI)")
     args = p.parse_args()
 
     if args.dump:
         sys.exit(dump_mode(args.warn, args.crit, args.sort))
-    sys.exit(run_tui(args.warn, args.crit, args.sort, args.interval_focus, args.interval_blur))
+    sys.exit(run_tui(args.warn, args.crit, args.sort, args.interval_focus, args.interval_blur, args.system_hz))
 
 
 if __name__ == "__main__":
