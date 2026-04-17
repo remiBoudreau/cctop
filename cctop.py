@@ -63,6 +63,13 @@ DEFAULT_INTERVAL_BLUR = 300
 # Default 2 Hz (every 500 ms). Override with --system-hz.
 DEFAULT_SYSTEM_HZ = 2
 
+# Minimum terminal height (rows) to show the bottom panel. Below this,
+# hide the panel and give all vertical space to the accounts pane.
+# System bar (3) + accounts header (1) + ~8 accounts + footer (1) needs
+# ~13 rows just for the top half. Require at least 12 more rows for
+# a useful panel view.
+DEFAULT_PANEL_MIN_HEIGHT = 25
+
 IN_USE_WINDOW_SEC = 120
 HTTP_TIMEOUT = 10.0
 BAR_WIDTH_SYSTEM = 20
@@ -484,26 +491,27 @@ def render_accounts(
     name_w = max((len(a.name) for a in accounts), default=8)
     name_w = max(name_w, 8)
 
-    ENG_W = 18   # engagement column width
+    # Engagement column: fit the longest active engagement name + padding,
+    # clamped to a sensible range so short names don't waste space and
+    # long names don't push the bars too narrow.
+    max_eng_len = max(
+        (len(e) for engs in (engagement_map or {}).values() for e in engs),
+        default=0,
+    )
+    ENG_W = max(12, min(24, max_eng_len + 2))
     RESET_W = 8  # reset/error column width
 
-    # Layout (char counts):
-    #   " # "   = 3       (index + pad)
-    #   name_w            (name column)
-    #   "  "    = 2
-    #   "[" + bw + "]"    (5-hour bar)
-    #   " "     = 1
-    #   RRRRRRRR = 8      (reset)
-    #   "  "    = 2
-    #   "[" + bw + "]"    (7-day bar)
-    #   " "     = 1
-    #   RRRRRRRR = 8      (reset)
-    #   " "     = 1
-    #   ENG_W             (engagement column)
-    # Total fixed (non-bar) = name_w + 30 + ENG_W + 1
+    # Bar width: divide remaining space between the two bars, but cap so
+    # very wide terminals don't produce 100+-char bars that look stretched.
+    MAX_BW = 40
     fixed = name_w + 30 + ENG_W + 1
     avail = term_width - fixed - 1
-    bw = max(5, avail // 2)
+    bw = max(5, min(MAX_BW, avail // 2))
+    # Extra unused width (when terminal is wider than our max layout) goes
+    # to trailing blanks on each row so the header stripe still spans the
+    # whole terminal.
+    used_cols = fixed + 2 * bw
+    trailing_pad = max(0, term_width - used_cols - 1)
 
     out = Text()
     HEADER_STYLE = "black on cyan bold"
@@ -593,6 +601,10 @@ def render_accounts(
         out.append(f"{eng_display:<{ENG_W}}", style=eng_style)
         if is_selected:
             out.append(" ◀", style="bold green")
+        else:
+            out.append("  ")
+        if trailing_pad > 0:
+            out.append(" " * trailing_pad)
         out.append("\n")
 
     return out
@@ -658,27 +670,27 @@ def run_tui(
     for keys, action, label in panel.keybindings():
         panel_bindings.append(Binding(keys, f"panel_{action}", label))
 
-    # Show the panel's pane only if the panel is non-null
-    show_panel = not isinstance(panel, panels_module.base.NoPanel)
+    # Whether we COULD show the panel (non-null panel class loaded).
+    # Actual visibility also depends on terminal height — the panel is
+    # hidden at runtime when the window is too short. Manual override
+    # via F3 toggle.
+    panel_enabled = not isinstance(panel, panels_module.base.NoPanel)
 
     class CctopApp(App):
-        CSS_TEMPLATE_WITH_PANEL = """
+        CSS = """
         Screen { layout: vertical; }
         #system { height: 3; padding: 0 1; }
         #accounts { height: auto; max-height: 50%; padding: 0 1; }
         #panel { height: 1fr; padding: 0 1; }
+        #panel.hidden { display: none; }
+        #accounts.fullheight { height: 1fr; max-height: 100%; }
         """
-        CSS_TEMPLATE_NO_PANEL = """
-        Screen { layout: vertical; }
-        #system { height: 3; padding: 0 1; }
-        #accounts { height: 1fr; padding: 0 1; }
-        """
-        CSS = CSS_TEMPLATE_WITH_PANEL if show_panel else CSS_TEMPLATE_NO_PANEL
         ansi_color = True
         BINDINGS = [
             ("f10,q", "quit", "Quit"),
             ("up,k", "cursor_up", "Up"),
             ("down,j", "cursor_down", "Down"),
+            ("f3", "toggle_panel", "Panel"),
         ] + panel_bindings
         ENABLE_COMMAND_PALETTE = False
 
@@ -692,15 +704,28 @@ def run_tui(
             self.interval_blur = interval_blur
             self.system_hz = system_hz
             self.panel = panel
-            self.show_panel = show_panel
+            self.panel_enabled = panel_enabled
+            # Manual override state. None = auto (based on height).
+            # True = force show. False = force hide.
+            self._panel_override: bool | None = None
             self.engagement_map: dict[str, list[str]] = {}
-            self.selected_row = 0 if show_panel else -1
+            self.selected_row = 0 if panel_enabled else -1
             self._virtual_rows: list = []
+
+        @property
+        def show_panel(self) -> bool:
+            """Whether the bottom panel is currently visible."""
+            if not self.panel_enabled:
+                return False
+            if self._panel_override is not None:
+                return self._panel_override
+            h = self.size.height or 30
+            return h >= DEFAULT_PANEL_MIN_HEIGHT
 
         def compose(self) -> ComposeResult:
             yield Static(id="system")
             yield Static(id="accounts")
-            if self.show_panel:
+            if self.panel_enabled:
                 yield Static(id="panel")
             yield Footer()
 
@@ -712,6 +737,7 @@ def run_tui(
             # Initial engagement scan + selection sync before first render
             self._refresh_engagement_map()
             self._sync_panel_engagement()
+            self.call_after_refresh(self._apply_panel_visibility)
             self.call_after_refresh(self.update_display)
             self.run_worker(self._refresh_loop(), exclusive=True, group="api")
             self.run_worker(self._ui_refresh_loop(), exclusive=True, group="ui")
@@ -839,7 +865,38 @@ def run_tui(
                 self.sub_title = f"panel render error: {type(e).__name__}"
 
         def on_resize(self, event) -> None:
+            self._apply_panel_visibility()
             self.call_after_refresh(self.update_display)
+
+        def _apply_panel_visibility(self) -> None:
+            """Toggle panel/accounts CSS classes to match show_panel state."""
+            if not self.panel_enabled:
+                return
+            try:
+                panel_widget = self.query_one("#panel", Static)
+                accounts_widget = self.query_one("#accounts", Static)
+            except Exception:
+                return
+            if self.show_panel:
+                panel_widget.remove_class("hidden")
+                accounts_widget.remove_class("fullheight")
+            else:
+                panel_widget.add_class("hidden")
+                accounts_widget.add_class("fullheight")
+
+        def action_toggle_panel(self) -> None:
+            """F3: cycle through auto / force-show / force-hide."""
+            if not self.panel_enabled:
+                return
+            # auto → force-hide → force-show → auto
+            if self._panel_override is None:
+                self._panel_override = False
+            elif self._panel_override is False:
+                self._panel_override = True
+            else:
+                self._panel_override = None
+            self._apply_panel_visibility()
+            self.update_display()
 
         # ── cursor navigation ──────────────────────────────────────────
 
