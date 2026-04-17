@@ -274,6 +274,62 @@ async def poll_account(client: httpx.AsyncClient, account: AccountState) -> None
     account.consecutive_429 = 0           # reset backoff ladder
 
 
+class ProcStats:
+    """Per-PID CPU% and Mem% tracker with child-process aggregation.
+
+    Claude Code spawns many child processes (hook bash invocations,
+    subagents, MCP servers, node helpers). Reporting only the top PID's
+    usage undercounts significantly; reporting pid+children gives the
+    real footprint per engagement.
+
+    psutil.cpu_percent() returns the delta since the LAST call on the
+    same Process object, so we cache Process handles across polls to
+    get meaningful numbers. First call returns 0.0 (priming).
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict[int, psutil.Process] = {}
+
+    def _proc(self, pid: int) -> Optional[psutil.Process]:
+        p = self._cache.get(pid)
+        if p is not None:
+            return p
+        try:
+            p = psutil.Process(pid)
+            p.cpu_percent(interval=None)  # prime
+            self._cache[pid] = p
+            return p
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return None
+
+    def for_pid(self, pid: int) -> tuple[float, float]:
+        """Return (cpu_percent, mem_percent) for pid + its descendants."""
+        root = self._proc(pid)
+        if root is None:
+            self._cache.pop(pid, None)
+            return 0.0, 0.0
+        try:
+            procs = [root] + root.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            self._cache.pop(pid, None)
+            return 0.0, 0.0
+        total_cpu = 0.0
+        total_mem = 0.0
+        for p in procs:
+            try:
+                total_cpu += p.cpu_percent(interval=None)
+                total_mem += p.memory_percent()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return total_cpu, total_mem
+
+    def prune(self, live_pids: set[int]) -> None:
+        """Drop cache entries for PIDs that are no longer monitored."""
+        dead = [p for p in self._cache if p not in live_pids]
+        for p in dead:
+            self._cache.pop(p, None)
+
+
 async def poll_all(accounts: list[AccountState]) -> None:
     """Poll accounts SEQUENTIALLY with a small delay between each.
 
@@ -288,10 +344,10 @@ async def poll_all(accounts: list[AccountState]) -> None:
     async with httpx.AsyncClient() as client:
         for i, account in enumerate(accounts):
             if i > 0:
-                # 1s gap between polls keeps us under Anthropic's burst
+                # 1.5s gap between polls keeps us under Anthropic's burst
                 # rate limit. Skipped if account is in cooldown (fast path).
                 if account.cooldown_remaining <= 0:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(1.5)
             await poll_account(client, account)
 
 
@@ -484,6 +540,7 @@ def render_accounts(
     engagement_map: dict[str, list[str]] | None = None,
     selected_row: int = -1,
     show_engagement_column: bool = True,
+    engagement_stats: dict[str, tuple[float, float]] | None = None,
 ) -> Text:
     now = datetime.now(timezone.utc)
 
@@ -521,10 +578,17 @@ def render_accounts(
         eng_section_width = 0
     RESET_W = 8  # reset/error column width
 
+    # CPU/Mem columns (per-engagement htop-style stats). Only shown when
+    # the engagement column is shown AND we were given stats to render.
+    show_stats = show_engagement_column and engagement_stats is not None
+    CPU_W = 5  # "99.9%" / " 100%" — 5 chars
+    MEM_W = 5
+    stats_section_width = (1 + CPU_W + 1 + MEM_W) if show_stats else 0
+
     # Bar width: divide remaining space between the two bars, but cap so
     # very wide terminals don't produce 100+-char bars that look stretched.
     MAX_BW = 40
-    fixed = name_w + 30 + eng_section_width
+    fixed = name_w + 30 + stats_section_width + eng_section_width
     avail = term_width - fixed - 1
     bw = max(5, min(MAX_BW, avail // 2))
     # Extra unused width (when terminal is wider than our max layout) goes
@@ -540,6 +604,8 @@ def render_accounts(
         f"{'5-hour':<{bw + 2}} {'reset':>{RESET_W}}"
         f"  {'7-day':<{bw + 2}} {'reset':>{RESET_W}}"
     )
+    if show_stats:
+        header_text += f" {'CPU':>{CPU_W}} {'MEM':>{MEM_W}}"
     if show_engagement_column:
         header_text += f" {'Engagement':<{ENG_W}}"
     pad_count = max(0, term_width - len(header_text))
@@ -608,6 +674,31 @@ def render_accounts(
             blank_w = name_w + 2 + (bw + 2) + 1 + RESET_W + 2 + (bw + 2) + 1 + RESET_W
             out.append(" " * blank_w)
 
+        # CPU/Mem columns (per-engagement). Blank when the row has no
+        # engagement or when stats aren't available. Color-graded by
+        # the same warn/crit thresholds used for the quota bars.
+        if show_stats:
+            if eng and engagement_stats and eng in engagement_stats:
+                cpu, mem = engagement_stats[eng]
+                cpu_str = f"{cpu:4.1f}%" if cpu < 100 else f"{cpu:4.0f}%"
+                mem_str = f"{mem:4.1f}%"
+                cpu_style = (
+                    "bright_red" if cpu >= crit
+                    else "yellow" if cpu >= warn
+                    else "green"
+                )
+                mem_style = (
+                    "bright_red" if mem >= crit
+                    else "yellow" if mem >= warn
+                    else "green"
+                )
+                out.append(" ")
+                out.append(f"{cpu_str:>{CPU_W}}", style=cpu_style)
+                out.append(" ")
+                out.append(f"{mem_str:>{MEM_W}}", style=mem_style)
+            else:
+                out.append(" " + (" " * CPU_W) + " " + (" " * MEM_W))
+
         # Engagement column (if visible). Selected cell = green text
         # + trailing ◀ marker. Background stays terminal default.
         if show_engagement_column:
@@ -673,7 +764,7 @@ def run_tui(
     from textual.widgets import Footer, Static
 
     import panels as panels_module
-    from engagements import active_engagements_by_profile, engagement_dir
+    from engagements import engagement_dir, scan_active_instances
 
     accounts = discover_profiles()
     if not accounts:
@@ -731,6 +822,9 @@ def run_tui(
             # True = force show. False = force hide.
             self._panel_override: bool | None = None
             self.engagement_map: dict[str, list[str]] = {}
+            self.engagement_pids: dict[str, int] = {}
+            self.engagement_stats: dict[str, tuple[float, float]] = {}
+            self.proc_stats = ProcStats()
             self.selected_row = 0 if panel_enabled else -1
             self._virtual_rows: list = []
 
@@ -772,6 +866,7 @@ def run_tui(
             self.run_worker(self._refresh_loop(), exclusive=True, group="api")
             self.run_worker(self._ui_refresh_loop(), exclusive=True, group="ui")
             self.run_worker(self._engagement_loop(), exclusive=True, group="eng")
+            self.run_worker(self._stats_loop(), exclusive=True, group="stats")
 
         async def _refresh_loop(self) -> None:
             while True:
@@ -789,6 +884,25 @@ def run_tui(
             while True:
                 self.call_after_refresh(self.update_system_only)
                 await asyncio.sleep(period)
+
+        async def _stats_loop(self) -> None:
+            """Refresh per-engagement CPU/Mem stats every 2 seconds.
+
+            psutil.cpu_percent() returns a delta since last call, so
+            ticking regularly gives meaningful numbers. Runs alongside
+            the engagement scan (same cadence) but computes fresh
+            process stats even when the engagement list hasn't changed.
+            """
+            while True:
+                try:
+                    new_stats: dict[str, tuple[float, float]] = {}
+                    for eng, pid in self.engagement_pids.items():
+                        new_stats[eng] = self.proc_stats.for_pid(pid)
+                    self.engagement_stats = new_stats
+                except Exception:
+                    pass
+                self.call_after_refresh(self.update_accounts_only)
+                await asyncio.sleep(2.0)
 
         async def _engagement_loop(self) -> None:
             # Re-scan /proc for active engagements every 2 seconds. Cheap
@@ -813,7 +927,9 @@ def run_tui(
 
         def _refresh_engagement_map(self) -> bool:
             """Rescan /proc for running claude processes. Return True if changed."""
-            new_map = active_engagements_by_profile()
+            new_map, new_pids = scan_active_instances()
+            self.engagement_pids = new_pids
+            self.proc_stats.prune(set(new_pids.values()))
             if new_map == self.engagement_map:
                 return False
             was_empty = not self.engagement_map
@@ -899,6 +1015,7 @@ def run_tui(
                         self.accounts, self.warn, self.crit, self.sort_mode,
                         usable, self.engagement_map, effective_selected,
                         show_engagement_column=self.show_engagement_column,
+                        engagement_stats=self.engagement_stats,
                     )
                 )
                 self.sub_title = f"{len(self.accounts)} accounts · panel={self.panel.name}"

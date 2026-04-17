@@ -86,15 +86,16 @@ def _profile_name_from_config_dir(config_dir: str) -> str | None:
     return None
 
 
-def active_engagements_by_profile() -> Dict[str, List[str]]:
-    """Map profile_name -> list of engagement names currently being worked on.
+def scan_active_instances() -> tuple[Dict[str, List[str]], Dict[str, int]]:
+    """Scan /proc for running claude processes. Return two views:
 
-    The 'default' profile (no CLAUDE_CONFIG_DIR set) uses the special
-    key 'default' so the caller can distinguish it if needed. In cctop
-    only profiles under ~/.claude-profiles/ are shown, so 'default' is
-    typically ignored.
+    1. profile_to_engagements: {profile_name: [engagement_name, ...]}
+       used by the accounts table to group rows by profile.
+    2. engagement_to_pid: {engagement_name: pid}
+       used by the proc-stats helper to look up CPU/Mem per engagement.
     """
-    result: Dict[str, List[str]] = {}
+    by_profile: Dict[str, List[str]] = {}
+    pids: Dict[str, int] = {}
     for pid in _running_claude_pids():
         env = _read_environ(pid)
         config_dir = env.get("CLAUDE_CONFIG_DIR", "")
@@ -104,10 +105,18 @@ def active_engagements_by_profile() -> Dict[str, List[str]]:
         eng = _resolve_engagement(pid, env)
         if not eng:
             continue
-        result.setdefault(profile, [])
-        if eng not in result[profile]:
-            result[profile].append(eng)
-    return result
+        by_profile.setdefault(profile, [])
+        if eng not in by_profile[profile]:
+            by_profile[profile].append(eng)
+        # First PID wins — one engagement per Claude instance is the norm
+        pids.setdefault(eng, pid)
+    return by_profile, pids
+
+
+def active_engagements_by_profile() -> Dict[str, List[str]]:
+    """Back-compat shim. Prefer scan_active_instances() for new callers."""
+    by_profile, _ = scan_active_instances()
+    return by_profile
 
 
 def engagement_dir(name: str) -> Path:
