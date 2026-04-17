@@ -304,11 +304,19 @@ class Panel(Panel):  # type: ignore[misc]
             return Group(header)
 
         cur = self._findings[self._index]
+        pos = f"{self._index + 1}/{len(self._findings)}"
+        # Budget the header to exactly one row. Layout:
+        #   <engagement> · <title> <pad> <pos> ◀ ▸
+        # Reserved fixed chars: " · " (3) + " " (1) + " ◀ ▸" (4) = 8
+        reserved = len(self.engagement) + 3 + 1 + len(pos) + 4
+        avail_for_title = max(10, width - reserved)
+        title = cur.title
+        if len(title) > avail_for_title:
+            title = title[: avail_for_title - 1].rstrip() + "…"
+        pad = max(1, width - len(self.engagement) - 3 - len(title) - 1 - len(pos) - 4)
         header.append(self.engagement, style="bold")
         header.append(" · ", style="dim")
-        header.append(cur.title, style="italic")
-        pos = f"{self._index + 1}/{len(self._findings)}"
-        pad = max(1, width - len(self.engagement) - len(" · ") - len(cur.title) - len(pos) - 4)
+        header.append(title, style="italic")
         header.append(" " * pad)
         header.append(pos, style="bold")
         header.append(" ◀ ▸", style="dim")
