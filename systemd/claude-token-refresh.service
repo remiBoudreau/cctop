@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh OAuth access tokens for all Claude Code profiles
+Documentation=https://github.com/remiBoudreau/cctop
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/cctop/claude-token-refresh.sh
+# claude CLI needs HOME and PATH
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+
+[Install]
+WantedBy=default.target

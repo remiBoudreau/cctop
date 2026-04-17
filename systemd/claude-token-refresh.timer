@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic OAuth token refresh for Claude Code profiles
+Documentation=https://github.com/remiBoudreau/cctop
+
+[Timer]
+# Run 2 minutes after boot, then every hour.
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
