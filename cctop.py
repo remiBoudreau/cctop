@@ -60,8 +60,8 @@ DEFAULT_INTERVAL_BLUR = 300
 
 # System meter (CPU/Mem/Swp) refresh cadence. Decoupled from API polling
 # so local stats update regardless of the 429-backoff state.
-# Default 1 Hz (htop-style). Override with --system-hz.
-DEFAULT_SYSTEM_HZ = 1
+# Default 2 Hz (every 500 ms). Override with --system-hz.
+DEFAULT_SYSTEM_HZ = 2
 
 IN_USE_WINDOW_SEC = 120
 HTTP_TIMEOUT = 10.0
