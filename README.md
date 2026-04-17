@@ -76,11 +76,9 @@ Account name colors (left column):
 
 ## Keeping dormant profiles from showing "expired"
 
-cctop reads static credential files. OAuth access tokens have a short TTL (~8-24h) and only get refreshed when Claude Code is actively used. Dormant profiles end up with stale tokens and cctop marks them **expired** — even though the refresh_token is still valid.
+cctop reads static credential files. OAuth access tokens have a short TTL (~8-24h) and only get refreshed when Claude Code is actively used — dormant profiles end up showing **expired** even though their refresh tokens are still valid.
 
-The bundled `claude-token-refresh.sh` script fixes this. It iterates every profile under `~/.claude-profiles/`, detects tokens that are expired or expiring within the next hour, and invokes `claude mcp list` in that profile. `mcp list` is a free operation (no model API call, no token consumption) but triggers Claude Code's built-in refresh_token exchange as a side effect.
-
-### Install the systemd user timer (runs hourly)
+The bundled `claude-token-refresh.sh` + systemd user timer fixes this. Quick install:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -89,39 +87,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now claude-token-refresh.timer
 ```
 
-Verify:
-```bash
-systemctl --user list-timers claude-token-refresh
-tail -f ~/.local/share/cctop/refresh.log
-```
-
-### Or via cron
-
-```bash
-crontab -e
-# Add:
-0 * * * * /home/$USER/cctop/claude-token-refresh.sh
-```
-
-### Run once manually
-
-```bash
-~/cctop/claude-token-refresh.sh
-tail ~/.local/share/cctop/refresh.log
-```
-
-### Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `CLAUDE_PROFILES_DIR` | `~/.claude-profiles` | Where profile dirs live |
-| `REFRESH_THRESHOLD_SECS` | `3600` | Refresh if token expires within this window |
-| `LOG_FILE` | `~/.local/share/cctop/refresh.log` | Append-only log |
-| `CLAUDE_BIN` | `claude` | Override claude binary path |
-
-### When refresh fails
-
-If the refresh_token itself has expired (typically after months of disuse), the script logs "claude ran but token NOT refreshed (refresh_token may be invalid — re-login required)" and exits non-zero. That profile needs a manual `CLAUDE_CONFIG_DIR=~/.claude-profiles/<name> claude login`.
+**Full documentation: [REFRESH.md](REFRESH.md)** — covers cron alternative, environment variables, troubleshooting, and failure handling.
 
 ## Design notes
 

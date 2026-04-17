@@ -25,9 +25,11 @@
 #   CLAUDE_BIN             Override the claude binary path. Default: claude
 #
 # Exit codes:
-#   0  all profiles processed successfully
-#   N  N profiles failed (stored refresh_token likely invalid)
-#   1  profiles dir not found
+#   0  script ran to completion (per-profile failures are logged, not propagated
+#      — a profile with an invalid refresh_token is a user issue, not a script
+#      issue, so we don't want systemd marking the unit as failed for that)
+#   1  script-level error (profiles dir missing, claude/jq not installed,
+#      another instance already running, etc.)
 # ============================================================================
 
 set -euo pipefail
@@ -125,7 +127,14 @@ main() {
     done
 
     log "--- refresh run done: $total profiles, $failed failed ---"
-    exit "$failed"
+    if [ "$failed" -gt 0 ]; then
+        # Per-profile refresh failures are expected when a refresh_token
+        # has fully expired (requires interactive re-login). This is NOT
+        # a script failure - we still exit 0 so systemd doesn't flag the
+        # unit as failed. The affected profile name is in the log.
+        log "(non-fatal: $failed profile(s) need interactive re-login - see log)"
+    fi
+    exit 0
 }
 
 # Serialize concurrent runs (cron + manual, or overlapping timers).
